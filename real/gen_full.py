@@ -1,0 +1,214 @@
+"""Aggregate the full-scale Dixie study (fs_[ab].json, fs_extra_*.json, lns.json, design_check.csv, dins_cells.csv), write TikZ figures and fill @@XF_*@@ tokens in ../paper/v4_body_filled.tex."""
+import json, glob, re, numpy as np, pandas as pd, h3
+from scipy.stats import wilcoxon
+OUT = '../paper/figures/tikz/'; tok = {}
+F = []
+import os
+GM = os.environ.get('QCDF_GEN_MODEL', 'prospective')
+PAT = {'oracle': ['fs_[ab].json', 'fs_late_[ab].json'], 'prospective': ['fsP_act.json', 'fsP_late.json']}[GM]
+SUF = '' if GM == 'oracle' else '_' + GM
+for p_ in PAT:
+    for f in sorted(glob.glob(p_)): F += json.load(open(f))
+F = sorted(F, key=lambda r: r['T0']); SPLIT = '2021-08-05'
+act = [r for r in F if r['T0'] <= SPLIT]; late = [r for r in F if r['T0'] > SPLIT]
+G = pd.read_csv('dins_cells.csv'); dins = dict(zip(G.h3, G.dins_res_destroyed))
+import geopandas as gpd
+GR = gpd.read_file('grid_r7.gpkg'); GR['ign_date'] = pd.to_datetime(GR['ign_date']); ign = dict(zip(GR.h3, GR.ign_date))
+METH = [('B6_random', 'random'), ('B1_communities', 'communities first'), ('B2_nearest_front', 'nearest to front'),
+        ('B3_wind_downstream', 'wind-downstream'), ('B4_value_at_risk', 'value at risk $H_iP_i$'), ('QCDF_h_only', 'QCDF, $J=0$'),
+        ('QCDF_SA', 'QCDF, SA in $\\feasible_K$'), ('QCDF_MILP', 'QCDF, exact'), ('CELF_greedy', 'greedy on simulator')]
+Ks = ['5', '10', '20']
+def S(rs, K, m): return np.array([r['K'][K]['eval'][m]['saved_pct'] for r in rs])
+def dins_cov(rs, K, m):
+    num = den = 0
+    for r in rs:
+        T0 = pd.Timestamp(r['T0']); plan = r['K'][K]['eval'][m]['plan']
+        hit = lambda c: (c in ign) and pd.notna(ign[c]) and T0 < ign[c] <= T0 + pd.Timedelta(days=10)
+        num += sum(dins.get(c, 0) for c in plan if hit(c))
+    return num
+
+def dins_den(rs):
+    tot = 0
+    for r in rs:
+        T0 = pd.Timestamp(r['T0'])
+        tot += sum(v for c, v in dins.items() if c in ign and pd.notna(ign[c]) and T0 < ign[c] <= T0 + pd.Timedelta(days=10))
+    return tot
+rows = []
+for m, lab in METH:
+    cells = [f"${S(act, K, m).mean():.1f}\\pm{S(act, K, m).std(ddof=1)/np.sqrt(len(act)):.1f}$" for K in Ks]
+    prec = np.mean([r['K']['10']['eval'][m]['prec'] for r in act])
+    cov = dins_cov(act, '10', m) / max(dins_den(act), 1)
+    rows.append(f"{lab} & " + " & ".join(cells) + f" & ${100*prec:.0f}$ & ${100*cov:.0f}$ & ${S(late, '10', m).mean():.1f}$ \\\\")
+tok['XF_MAINROWS'] = "\n".join(rows)
+
+def cmp(a, b, K):
+    d = S(act, K, a) - S(act, K, b); w = wilcoxon(d).pvalue if np.any(np.abs(d) > 1e-9) else 1.0
+    return d.mean(), int((d > 0.05).sum()), int((np.abs(d) <= 0.05).sum()), int((d < -0.05).sum()), w
+for K in Ks:
+    for a, b, nm in [('QCDF_MILP', 'B4_value_at_risk', 'var'), ('QCDF_MILP', 'QCDF_h_only', 'honly'), ('QCDF_MILP', 'CELF_greedy', 'celf'), ('QCDF_MILP', 'B2_nearest_front', 'front'), ('QCDF_MILP', 'B1_communities', 'comm')]:
+        dm, bb, tt, ww, p = cmp(a, b, K)
+        tok[f'XF_d_{nm}_{K}'] = f"{dm:+.1f}"; tok[f'XF_w_{nm}_{K}'] = f"{bb}/{tt}/{ww}"
+        tok[f'XF_p_{nm}_{K}'] = f"{p:.3f}" if p >= 0.001 else f"{p:.0e}".replace('e-0', '\\times10^{-') + '}'
+    for m, _ in METH: tok[f'XF_s_{m}_{K}'] = f"{S(act, K, m).mean():.1f}"
+    tok[f'XF_cevals_{K}'] = f"{np.mean([r['K'][K]['celf_evals'] for r in act]):.0f}"
+    tok[f'XF_fid_rho_{K}'] = f"{np.median([r['K'][K]['fidelity']['spearman'] for r in act]):.2f}"
+    tok[f'XF_fid_r2_{K}'] = f"{np.median([r['K'][K]['fidelity']['r2'] for r in act]):.2f}"
+    tok[f'XF_gapSA_{K}'] = f"{np.mean([(r['K'][K]['E_sa'] - r['K'][K]['E_milp']) / abs(r['K'][K]['E_milp']) for r in act]) * 100:.2f}"
+tok['XF_elig_min'] = str(min(r['n_elig'] for r in F)); tok['XF_elig_max'] = str(max(r['n_elig'] for r in F))
+tok['XF_nJ'] = f"{np.mean([r['n_J'] for r in F]):.0f}"; tok['XF_npairs'] = f"{np.mean([r['n_pairs'] for r in F]):.0f}"
+tok['XF_compl'] = str(int(np.sum([r['n_compl'] for r in F]))); tok['XF_redund'] = str(int(np.sum([r['n_redund'] for r in F])))
+tok['XF_nonzero'] = f"{np.mean([r['n_compl'] + r['n_redund'] for r in F]):.0f}"
+tok['XF_prec_rand'] = f"{100*np.mean([r['K']['10']['eval']['B6_random']['prec'] for r in act]):.0f}"; tok['XF_nact'] = str(len(act)); tok['XF_nlate'] = str(len(late))
+tok['XF_dins_res_10_act'] = str(int(dins_den(act)))
+
+Gm = GR.merge(G, on='h3', how='left').fillna({'dins_res_destroyed': 0}); b = Gm[Gm.ign_date.notna()]; x = b[b.HOUSING20 > 0]
+tok['XF_rho'] = f"{b.dins_res_destroyed.sum() / b.HOUSING20.sum():.2f}"; tok['XF_dins_r'] = f"{np.corrcoef(x.HOUSING20, x.dins_res_destroyed)[0, 1]:.2f}"
+
+cols = {'5': 'qblue!35', '10': 'qblue!65', '20': 'qblue'}
+plots = "\n".join(rf"\addplot[fill={cols[K]},draw=qblue!80!black,error bars/.cd,y dir=both,y explicit] coordinates {{" + " ".join(
+    f"({i},{S(act, K, m).mean():.2f}) +- (0,{S(act, K, m).std(ddof=1)/np.sqrt(len(act)):.2f})" for i, (m, _) in enumerate(METH)) + "};" for K in Ks)
+open(OUT + 'fullbars.tex', 'w').write(rf"""% full-scale Dixie, active phase, generated by real/gen_full.py
+\begin{{tikzpicture}}
+\begin{{axis}}[ybar,bar width=4.5pt,width=\linewidth,height=6.2cm,ymin=0,ymax=115,ytick={{0,20,...,100}},ymajorgrids,grid style={{gray!20}},
+ ylabel={{housing loss avoided (\%)}},xtick={{0,...,{len(METH)-1}}},xticklabels={{{",".join("{"+l+"}" for _, l in METH)}}},
+ x tick label style={{rotate=30,anchor=east,font=\scriptsize}},legend style={{font=\scriptsize,at={{(0.02,0.98)}},anchor=north west}},legend columns=3]
+{plots}
+\legend{{$K=5$,$K=10$,$K=20$}}
+\end{{axis}}
+\end{{tikzpicture}}
+""")
+
+try:
+    LP = json.load(open(f'fs_extra_loop{SUF}.json'))['loop']
+    ser = []
+    for key, col, lab in [('closed_QCDF', 'qsel', 'closed loop, QCDF'), ('closed_VaR', 'qblue', 'closed loop, value at risk'), ('open_QCDF_24Jul', 'gray', 'open loop (plan of 24 July)')]:
+        ser.append(rf"\addplot[{col},thick,mark=*,mark size=1.2pt] coordinates {{" + " ".join(f"({k},{r[key]['saved_pct']:.1f})" for k, r in enumerate(LP)) + "};")
+    labs = ",".join("{" + pd.Timestamp(r['T0']).strftime('%-d/%-m') + "}" for r in LP)
+    open(OUT + 'fullloop.tex', 'w').write(rf"""% closed vs open loop, generated by real/gen_full.py
+\begin{{tikzpicture}}
+\begin{{axis}}[width=0.8\linewidth,height=5.2cm,ymin=0,ymax=100,grid=major,grid style={{gray!20}},ylabel={{loss avoided (\%)}},
+ xtick={{0,...,{len(LP)-1}}},xticklabels={{{labs}}},x tick label style={{font=\scriptsize}},xlabel={{decision date (2021)}},
+ legend style={{font=\scriptsize,at={{(0.98,0.02)}},anchor=south east}}]
+{chr(10).join(ser)}
+\legend{{closed loop (QCDF),closed loop (value at risk),open loop (QCDF plan of 24 July)}}
+\end{{axis}}
+\end{{tikzpicture}}
+""")
+    c = np.array([r['closed_QCDF']['saved_pct'] for r in LP]); o = np.array([r['open_QCDF_24Jul']['saved_pct'] for r in LP]); v = np.array([r['closed_VaR']['saved_pct'] for r in LP])
+    tok['XF_loop_closed'] = f"{c[1:].mean():.1f}"; tok['XF_loop_open'] = f"{o[1:].mean():.1f}"; tok['XF_loop_var'] = f"{v[1:].mean():.1f}"
+    tok['XF_loop_units'] = str(LP[-1]['n_units']); tok['XF_loop_n'] = str(len(LP))
+    d = c - v; tok['XF_loop_dvar'] = f"{d.mean():+.1f}"; tok['XF_loop_wvar'] = f"{(d>0.05).sum()}/{(abs(d)<=0.05).sum()}/{(d<-0.05).sum()}"
+except FileNotFoundError: pass
+
+try:
+    GV = json.load(open(f'fs_extra_green{SUF}.json'))['greenville']
+    rows = []
+    for r in GV:
+        rows.append(f"{pd.Timestamp(r['T0']).strftime('%-d %b')} & {r['ring']} & ${100*r['P_burn10']:.0f}$ & {r['rank_delta']} & {r['rank_var']} & {r['rank_communities']} & "
+                    + " & ".join('\\checkmark' if r[f'in_QCDF_K{K}'] else '--' for K in (5, 10, 20)) + " \\\\")
+    tok['XF_GVROWS'] = "\n".join(rows)
+except FileNotFoundError: tok['XF_GVROWS'] = ''
+
+try:
+    SE = pd.DataFrame(json.load(open('fs_extra_sens.json'))['sens'])
+    SE['d_var'] = SE.QCDF_MILP - SE.B4_value_at_risk; SE['d_celf'] = SE.QCDF_MILP - SE.CELF_greedy
+    g = SE.groupby(['mode', 'eta', 'K'])[['QCDF_MILP', 'B4_value_at_risk', 'CELF_greedy', 'd_var', 'd_celf']].mean().reset_index()
+    rows = []
+    for (mode, eta), x in g.groupby(['mode', 'eta']):
+        lab = f"${eta:.2f}$" + (" (weather)" if mode == 'weather' else '')
+        rows.append(lab + " & " + " & ".join(f"${r.QCDF_MILP:.1f}$ & ${r.d_var:+.1f}$" for r in x.sort_values('K').itertuples()) + " \\\\")
+    tok['XF_SENSROWS'] = "\n".join(rows)
+    tok['XF_sens_dmin'] = f"{g.d_var.min():+.1f}"; tok['XF_sens_dmax'] = f"{g.d_var.max():+.1f}"
+    tok['XF_sens_neg'] = str(int((g.d_var < -0.05).sum())); tok['XF_sens_n'] = str(len(g))
+    gw = g[g['mode'] == 'weather']; tok['XF_sens_wmin'] = f"{gw.d_var.min():+.1f}"; tok['XF_sens_wmax'] = f"{gw.d_var.max():+.1f}"
+except FileNotFoundError: tok['XF_SENSROWS'] = ''
+
+DC = pd.read_csv('design_check.csv')
+tok['XF_dc_A'] = f"{DC.iloc[:, 2].min():.0f}--{DC.iloc[:, 2].max():.0f}"; tok['XF_dc_B'] = f"{DC.iloc[:, 3].min():.0f}--{DC.iloc[:, 3].max():.0f}"
+tok['XF_dc_C'] = f"{DC.iloc[:, 4].min():.0f}--{DC.iloc[:, 4].max():.0f}"; tok['XF_dc_D'] = f"{DC.iloc[:, 5].min():.0f}--{DC.iloc[:, 5].max():.0f}"
+
+try:
+    LN = json.load(open('lns.json'))
+    arms = ['exact', 'uniform', 'qaoa', 'anneal']
+    gm = {a: np.mean([np.mean(r['arms'][a]['gap']) for r in LN]) * 100 for a in arms}
+    pm = {a: np.mean([np.mean([x for x in r['arms'][a]['popt'] if x is not None]) for r in LN]) * 100 for a in arms}
+    for a in arms: tok[f'XF_lns_gap_{a}'] = f"{gm[a]:.1f}"; tok[f'XF_lns_popt_{a}'] = f"{pm[a]:.1f}"
+    tok['XF_lns_start'] = f"{np.mean([(r['E_start'] - r['E_milp']) / abs(r['E_milp']) for r in LN]) * 100:.1f}"
+    tok['XF_lns_n'] = str(len(LN))
+    qs = [0.02, 0.1, 0.3, 1.0]
+    gq = [np.mean([np.mean(r['arms'][f'oracle_{q}']['gap']) for r in LN]) * 100 for q in qs]
+    tok['XF_lns_q'] = ", ".join(f"$q={q:g}$: ${v:.1f}\\%$" for q, v in zip(qs, gq))
+    ev = {k: np.mean([r['eval'][k] for r in LN]) for k in LN[0]['eval']}
+    for k, v in ev.items(): tok[f'XF_lns_ev_{k}'] = f"{v:.1f}"
+    bars = " ".join(f"({i},{gm[a]:.2f})" for i, a in enumerate(arms))
+    pts = " ".join(f"({q},{v:.2f})" for q, v in zip(qs, gq))
+    open(OUT + 'fulllns.tex', 'w').write(rf"""% LNS arms, generated by real/gen_full.py
+\begin{{tikzpicture}}
+\begin{{groupplot}}[group style={{group size=2 by 1,horizontal sep=1.6cm}},height=4.8cm,grid style={{gray!20}},title style={{font=\small}}]
+\nextgroupplot[ybar,bar width=12pt,width=0.48\linewidth,ymin=0,ymajorgrids,ylabel={{gap to exact optimum (\%)}},title={{(a) LNS sub-solver}},
+ xtick={{0,...,3}},xticklabels={{exact,{{uniform $p{{=}}0$}},{{QAOA $p{{=}}3$}},anneal}},x tick label style={{font=\scriptsize}},nodes near coords,every node near coord/.append style={{font=\tiny}}]
+\addplot[fill=qblue!50,draw=qblue] coordinates {{{bars}}};
+\nextgroupplot[width=0.48\linewidth,xmode=log,ymin=0,grid=major,xlabel={{sub-solver success probability $q$}},title={{(b) threshold curve}}]
+\addplot[qsel,thick,mark=*] coordinates {{{pts}}};
+\addplot[qblue,dashed] coordinates {{(0.02,{gm['qaoa']:.2f}) (1,{gm['qaoa']:.2f})}};
+\end{{groupplot}}
+\end{{tikzpicture}}
+""")
+except FileNotFoundError: pass
+json.dump(tok, open('full_tokens.json', 'w'), indent=1)
+fn = '../paper/v4_body_filled.tex'; s = open(fn).read()
+for _ in range(2):
+    for k, v in sorted(tok.items(), key=lambda kv: -len(kv[0])): s = s.replace('@@' + k + '@@', v)
+open(fn, 'w').write(s)
+print('unfilled', sorted(set(re.findall(r'@@(\w+)@@', s))))
+for k, v in tok.items():
+    if 'ROWS' not in k: print(k, v)
+for k in ('XF_MAINROWS', 'XF_GVROWS', 'XF_SENSROWS'): print(tok.get(k, ''))
+
+MAPD = '2021-07-31'; rec = next(r for r in F if r['T0'] == MAPD)
+GR2 = GR.copy(); idx = {c: k for k, c in enumerate(GR2.h3)}
+NBR = [[idx[x] for x in h3.grid_ring(c, 1) if x in idx] for c in GR2.h3]
+T0 = pd.Timestamp(MAPD); burned = (GR2.ign_date <= T0).values
+dist = np.full(len(GR2), 99); fr = list(np.where(burned)[0]); dist[fr] = 0
+for rr in range(1, 9):
+    nx = []
+    for i in fr:
+        for j in NBR[i]:
+            if dist[j] == 99: dist[j] = rr; nx.append(j)
+    fr = nx
+show = np.where(dist <= 8)[0]; newb = ((GR2.ign_date > T0) & (GR2.ign_date <= T0 + pd.Timedelta(days=10))).values
+q = {idx[c] for c in rec['K']['10']['eval']['QCDF_MILP']['plan']}; v_ = {idx[c] for c in rec['K']['10']['eval']['B4_value_at_risk']['plan']}
+cm = {idx[c] for c in rec['K']['10']['eval']['B1_communities']['plan']}
+lat0, lon0 = GR2.lat.values[show].mean(), GR2.lon.values[show].mean()
+proj = lambda la, lo: ((lo - lon0) * np.cos(np.radians(lat0)) * 111.32, (la - lat0) * 110.57)
+pts = {i: [proj(a, b) for a, b in h3.cell_to_boundary(GR2.h3.iloc[i])] for i in show}
+allx = [p[0] for vv in pts.values() for p in vv]; ally = [p[1] for vv in pts.values() for p in vv]
+sc = 11.0 / (max(allx) - min(allx)); P_ = lambda i: " -- ".join(f"({x*sc:.2f},{y*sc:.2f})" for x, y in pts[i]) + " -- cycle"
+L = [f"% full-scale plans {MAPD} K=10, generated by real/gen_full.py", "\\begin{tikzpicture}[x=1cm,y=1cm]"]
+for i in show:
+    st = "fill=gray!45,draw=gray!60,line width=0.1pt" if burned[i] else ("fill=orange!55,draw=orange!80!black,line width=0.1pt" if newb[i] else
+         ("fill=white,draw=gray!45,line width=0.15pt" if dist[i] <= 3 else "fill=gray!6,draw=gray!25,line width=0.1pt"))
+    L.append(f"\\filldraw[{st}] {P_(i)};")
+for i in q: L.append(f"\\filldraw[fill=qsel,draw=black,line width=0.5pt] {P_(i)};")
+for i in v_: L.append(f"\\draw[black,line width=1.1pt] {P_(i)};")
+for i in cm: L.append(f"\\draw[qblue!80!black,line width=1.1pt,densely dashed] {P_(i)};")
+D_ = dict(zip(G.h3, G.dins_res_destroyed))
+for i in show:
+    d_ = D_.get(GR2.h3.iloc[i], 0)
+    if d_ > 0 and not burned[i]:
+        x, y = proj(GR2.lat.values[i], GR2.lon.values[i]); L.append(f"\\fill[black] ({x*sc:.2f},{y*sc:.2f}) circle ({0.015*np.sqrt(d_):.3f});")
+x0, y0 = min(allx) * sc, min(ally) * sc - 0.4
+L.append(f"\\draw[thick] ({x0:.2f},{y0:.2f}) -- ({x0+20*sc:.2f},{y0:.2f}) node[midway,below,font=\\scriptsize]{{20 km}};")
+lx, ly = max(allx) * sc + 0.4, min(ally) * sc + 3.6
+items = [("fill=gray!45,draw=gray!60", "burned by $T_0$"), ("fill=orange!55,draw=orange!80!black", "burned in next 10 days"),
+         ("fill=white,draw=gray!45", "eligible (3 rings)"), ("fill=qsel,draw=black", "QCDF exact, $K=10$"),
+         ("fill=white,draw=black,line width=1.1pt", "value at risk, $K=10$"), ("fill=white,draw=qblue!80!black,line width=1.1pt,densely dashed", "communities first")]
+for n_, (s_, t_) in enumerate(items):
+    yy = ly - 0.55 * n_
+    L.append(f"\\filldraw[{s_}] ({lx:.2f},{yy:.2f}) rectangle ({lx+0.35:.2f},{yy+0.3:.2f}); \\node[right,font=\\scriptsize] at ({lx+0.4:.2f},{yy+0.15:.2f}) {{{t_}}};")
+yy = ly - 0.55 * 6
+L.append(f"\\fill[black] ({lx+0.17:.2f},{yy+0.15:.2f}) circle ({0.015*np.sqrt(50):.3f}); \\node[right,font=\\scriptsize] at ({lx+0.4:.2f},{yy+0.15:.2f}) {{50 destroyed residences (DINS)}};")
+L.append("\\end{tikzpicture}")
+open(OUT + 'fullmap.tex', 'w').write("\n".join(L) + "\n")
+s = open(fn).read(); s = s.replace('@@XF_MAPDATE@@', T0.strftime('%-d %B %Y')); open(fn, 'w').write(s)
+print('map overlap QCDF/VaR', len(q & v_), 'QCDF/comm', len(q & cm))
